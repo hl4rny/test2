@@ -5,7 +5,13 @@ unit DatabaseHandler;
 interface
 
 uses
-  Classes, SysUtils, DateUtils, LogHandlers, SyncObjs, ZConnection, ZDataset;
+  Classes, SysUtils, DateUtils, Generics.Collections,
+  ZConnection, ZDataset, ZDbcIntfs, Dialogs,
+  LogHandlers, McJSON, Variants;
+
+
+const
+  DEFAULT_RETENTION_MONTHS = 12;
 
 type
   // 로그 큐 아이템 (비동기 처리용)
@@ -28,6 +34,20 @@ type
 
   TLogTableInfoArray = array of TLogTableInfo;
 
+  TLogExtendedData = class
+  private
+    FJsonObject: TMcJsonObject;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure AddProperty(const Name: string; const Value: Variant);
+    procedure AddJsonObject(const Name: string; JsonObj: TMcJsonObject);
+    procedure AddJsonArray(const Name: string; JsonArr: TMcJsonArray);
+    function AsJson: string;
+    function AsJsonObject: TMcJsonObject;
+  end;
+
+
   { TDatabaseHandler - 데이터베이스 로그 핸들러 }
   TDatabaseHandler = class(TLogHandler)
   private
@@ -43,6 +63,15 @@ type
     FLastCleanupDate: TDateTime;     // 마지막 정리 날짜
     FCurrentMonthTable: string;      // 현재 월 테이블 이름
     FLastTableCheck: TDateTime;      // 마지막으로 테이블 체크한 시간
+    // Ext
+    FQuery: TZQuery;
+    FServerName: string;
+    FDatabaseName: string;
+    FUserName: string;
+    FPassword: string;
+    FConnected: Boolean;
+    FRetentionMonths: Integer;
+    FJsonLogPath: string;
 
     // 비동기 처리 관련 필드
     FLogQueue: TThreadList;          // 로그 메시지 큐
@@ -63,18 +92,34 @@ type
     procedure CleanupOldLogs;
     procedure EnsureCurrentMonthTable;
 
+    // Ext
+    procedure InitializeTables;
+    function GetLogRecordId(const LogItem: TLogItem): Integer;
+    procedure WriteExtendedData(LogId: Integer; const ExtData: TLogExtendedData);
+    function FormatDateTime(const Value: TDateTime): string;
+
+    // JSON 관련 기능
+    procedure WriteJsonLog(const LogItem: TLogItem; const ExtData: TLogExtendedData = nil);
+    function GetJsonLogFileName: string;
+    procedure SyncJsonToDatabase;
   protected
     procedure WriteLog(const Msg: string; Level: TLogLevel); override;
 
   public
-    constructor Create(const AHost, ADatabase, AUser, APassword: string); reintroduce;
+    constructor Create(const AServerName, ADatabaseName, AUserName, APassword: string); reintroduce;
     destructor Destroy; override;
+    // Ext
+    procedure WriteLog(const LogItem: TLogItem); override;
+    procedure WriteLogWithExtData(const LogItem: TLogItem; const ExtData: TLogExtendedData);
+    // 로그 조회 및 관리
+    procedure ExecuteLogMaintenance;
+    function QueryLogs(const SQL: string): TZQuery;
 
     procedure Init; override;
     procedure Shutdown; override;
 
     // 데이터베이스 연결 설정
-    procedure SetConnection(const AHost, ADatabase, AUser, APassword: string);
+    procedure SetConnection(const AServerName, ADatabaseName, AUserName, APassword: string);
 
     // 로그 조회 메서드
     function GetLogs(const StartDate, EndDate: TDateTime;
@@ -90,7 +135,10 @@ type
     property AutoCreateTable: Boolean read FAutoCreateTable write FAutoCreateTable;
     property QueueMaxSize: Integer read FQueueMaxSize write FQueueMaxSize;
     property QueueFlushInterval: Integer read FQueueFlushInterval write FQueueFlushInterval;
+    // Ext
     property RetentionMonths: Integer read FRetentionMonths write FRetentionMonths;
+    property JsonLogPath: string read FJsonLogPath write FJsonLogPath;
+    property Connected: Boolean read FConnected;
   end;
 
 // GlobalLogger에서 DatabaseHandler 인스턴스를 찾는 함수
@@ -99,12 +147,64 @@ type
 implementation
 
 uses
-  GlobalLogger;
+  GlobalLogger, StrUtils;
+
+
+{ TLogExtendedData }
+constructor TLogExtendedData.Create;
+begin
+  inherited;
+  FJsonObject := TMcJsonObject.Create;
+end;
+
+destructor TLogExtendedData.Destroy;
+begin
+  FJsonObject.Free;
+  inherited;
+end;
+
+procedure TLogExtendedData.AddProperty(const Name: string; const Value: Variant);
+begin
+  case VarType(Value) of
+    varInteger, varInt64, varByte, varSmallint, varShortInt, varWord, varLongWord:
+      FJsonObject.Add(Name, Integer(Value));
+    varSingle, varDouble, varCurrency:
+      FJsonObject.Add(Name, Double(Value));
+    varBoolean:
+      FJsonObject.Add(Name, Boolean(Value));
+    varNull:
+      FJsonObject.AddNull(Name);
+    else
+      FJsonObject.Add(Name, String(Value));
+  end;
+end;
+
+procedure TLogExtendedData.AddJsonObject(const Name: string; JsonObj: TMcJsonObject);
+begin
+  FJsonObject.Add(Name, JsonObj);
+end;
+
+procedure TLogExtendedData.AddJsonArray(const Name: string; JsonArr: TMcJsonArray);
+begin
+  FJsonObject.Add(Name, JsonArr);
+end;
+
+function TLogExtendedData.AsJson: string;
+begin
+  Result := FJsonObject.AsJson;
+end;
+
+function TLogExtendedData.AsJsonObject: TMcJsonObject;
+begin
+  Result := FJsonObject;
+end;
+
+
+
 
 
 { TDatabaseHandler }
-
-constructor TDatabaseHandler.Create(const AHost, ADatabase, AUser, APassword: string);
+constructor TDatabaseHandler.Create(const AServerName, ADatabaseName, AUserName, APassword: string);
 begin
   inherited Create;
 
@@ -113,15 +213,27 @@ begin
     FTablePrefix := 'LOGS';
     FMetaTableName := 'LOG_META';
     FAutoCreateTable := True;
-    FRetentionMonths := 12;          // 기본 12개월 보관
     FLastCleanupDate := 0;           // 초기값 0으로 설정해 첫 로그 작성시 정리 실행
     FLastTableCheck := 0;            // 초기화
     FCurrentMonthTable := '';        // 아직 결정되지 않음
 
     // 데이터베이스 객체 생성
     FConnection := TZConnection.Create(nil);
+    FQuery := TZQuery.Create(nil);
+    FQuery.Connection := FConnection;
     FLogQuery := TZQuery.Create(nil);
     FLogQuery.Connection := FConnection;
+
+    FServerName := AServerName;
+    FDatabaseName := ADatabaseName;
+    FUserName := AUserName;
+    FPassword := APassword;
+    FRetentionMonths := DEFAULT_RETENTION_MONTHS;
+
+    // 기본 JSON 로그 경로 설정
+    FJsonLogPath := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)) + 'Logs\Json');
+    if not DirectoryExists(FJsonLogPath) then
+      ForceDirectories(FJsonLogPath);
 
     // 비동기 처리 관련
     FLogQueue := TThreadList.Create;
@@ -130,7 +242,7 @@ begin
     FLastQueueFlush := Now;
 
     // 연결 정보 설정
-    SetConnection(AHost, ADatabase, AUser, APassword);
+    SetConnection(AServerName, ADatabaseName, AUserName, APassword);
   except
     on E: Exception do
       DebugToFile('DatabaseHandler 초기화 오류: ' + E.Message);
@@ -147,6 +259,8 @@ begin
     FLogQueue.Free;
 
     // 데이터베이스 객체 해제
+    if Assigned(FQuery) then
+      FreeAndNil(FQuery);
     if Assigned(FLogQuery) then
       FreeAndNil(FLogQuery);
     if Assigned(FConnection) then
@@ -216,7 +330,7 @@ begin
   inherited;
 end;
 
-procedure TDatabaseHandler.SetConnection(const AHost, ADatabase, AUser, APassword: string);
+procedure TDatabaseHandler.SetConnection(const AServerName, ADatabaseName, AUserName, APassword: string);
 var
   AppPath: string;
   DbPath: string;
@@ -249,7 +363,7 @@ begin
 
     // DB 파일 경로 설정 (사용자 지정 이름이 있으면 사용, 없으면 기본 'Log.fdb' 사용)
     if ADatabase <> '' then
-      LogDbFile := ADatabase
+      LogDbFile := ADatabaseName
     else
       LogDbFile := 'Log.fdb';
 
@@ -261,9 +375,9 @@ begin
     FConnection.Protocol := 'firebird';
     FConnection.ClientCodepage := 'UTF8';
     FConnection.LibraryLocation := AppPath + 'fbclient.dll';
-    FConnection.HostName := AHost;
+    FConnection.HostName := AServerName;
     FConnection.Database := LogDbFile;
-    FConnection.User := AUser;
+    FConnection.User := AUserName;
     FConnection.Password := APassword;
 
     // DB가 없으면 생성
@@ -274,12 +388,13 @@ begin
       FConnection.Properties.Values['dialect'] := '3';
       FConnection.Properties.Values['CreateNewDatabase'] :=
         'CREATE DATABASE ' + QuotedStr(LogDbFile) +
-        ' USER ' + QuotedStr(AUser) +
+        ' USER ' + QuotedStr(AUserName) +
         ' PASSWORD ' + QuotedStr(APassword) +
         ' PAGE_SIZE 16384 DEFAULT CHARACTER SET UTF8';
 
       try
         FConnection.Connect;
+        FConnected := FConnection.Connected;
         DebugToFile('데이터베이스 생성 성공');
       except
         on E: Exception do
@@ -291,6 +406,7 @@ begin
       DebugToFile('기존 데이터베이스 파일에 연결 시도');
       try
         FConnection.Connect;
+        FConnected := FConnection.Connected;
         DebugToFile('데이터베이스 연결 성공');
       except
         on E: Exception do
@@ -299,8 +415,10 @@ begin
     end;
 
     // 테이블 생성 시도
-    if FConnection.Connected and FAutoCreateTable then
+    if FConnected and FAutoCreateTable then
     begin
+      InitializeTables;
+
       CreateMetaTable;
 
       // 현재 월 테이블 이름 초기화 및 생성 확인
@@ -314,6 +432,340 @@ begin
   end;
 end;
 
+procedure TDatabaseHandler.InitializeTables;
+begin
+  // LOG_MASTER 테이블 생성
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''LOG_MASTER'')) THEN ' +
+    '  EXECUTE STATEMENT ' +
+    '  ''CREATE TABLE LOG_MASTER ( ' +
+    '    LOG_ID INTEGER NOT NULL PRIMARY KEY, ' +
+    '    TIMESTAMP TIMESTAMP NOT NULL, ' +
+    '    LEVEL VARCHAR(10) NOT NULL, ' +
+    '    SOURCE VARCHAR(100), ' +
+    '    MESSAGE VARCHAR(1000), ' +
+    '    RAW_JSON BLOB SUB_TYPE TEXT, ' +  // JSON 저장용 컬럼 추가
+    '    EXTRAS JSON'' ' +                 // Firebird 5.0의 JSON 기본 지원 활용
+    '  END';
+  FQuery.ExecSQL;
+
+  // LOG_EXTENDED 테이블 생성
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ''LOG_EXTENDED'')) THEN ' +
+    '  EXECUTE STATEMENT ' +
+    '  ''CREATE TABLE LOG_EXTENDED ( ' +
+    '    EXT_ID INTEGER NOT NULL PRIMARY KEY, ' +
+    '    LOG_ID INTEGER NOT NULL, ' +
+    '    EXT_TYPE VARCHAR(50) NOT NULL, ' +
+    '    EXT_KEY VARCHAR(100) NOT NULL, ' +
+    '    EXT_VALUE_STR VARCHAR(1000), ' +
+    '    EXT_VALUE_NUM NUMERIC(18,4), ' +
+    '    EXT_VALUE_BOOL BOOLEAN, ' +
+    '    EXT_VALUE_DATE TIMESTAMP, ' +
+    '    CONSTRAINT FK_LOG_EXT FOREIGN KEY (LOG_ID) REFERENCES LOG_MASTER(LOG_ID) ON DELETE CASCADE'' ' +
+    '  END';
+  FQuery.ExecSQL;
+
+  // LOG_MASTER의 시퀀스 생성
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ''GEN_LOG_ID'')) THEN ' +
+    '  EXECUTE STATEMENT ''CREATE SEQUENCE GEN_LOG_ID''; ' +
+    'END';
+  FQuery.ExecSQL;
+
+  // LOG_EXTENDED의 시퀀스 생성
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ''GEN_LOG_EXT_ID'')) THEN ' +
+    '  EXECUTE STATEMENT ''CREATE SEQUENCE GEN_LOG_EXT_ID''; ' +
+    'END';
+  FQuery.ExecSQL;
+
+  // 인덱스 생성
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$INDICES WHERE RDB$INDEX_NAME = ''IDX_LOG_TIMESTAMP'')) THEN ' +
+    '  EXECUTE STATEMENT ''CREATE INDEX IDX_LOG_TIMESTAMP ON LOG_MASTER(TIMESTAMP)''; ' +
+    'END';
+  FQuery.ExecSQL;
+
+  FQuery.SQL.Text :=
+    'EXECUTE BLOCK AS ' +
+    'BEGIN ' +
+    '  IF (NOT EXISTS(SELECT 1 FROM RDB$INDICES WHERE RDB$INDEX_NAME = ''IDX_LOG_LEVEL'')) THEN ' +
+    '  EXECUTE STATEMENT ''CREATE INDEX IDX_LOG_LEVEL ON LOG_MASTER(LEVEL)''; ' +
+    'END';
+  FQuery.ExecSQL;
+end;
+
+function TDatabaseHandler.FormatDateTime(const Value: TDateTime): string;
+begin
+  Result := SysUtils.FormatDateTime('yyyy-mm-dd"T"hh:nn:ss.zzz', Value);
+end;
+
+procedure TDatabaseHandler.WriteLog(const LogItem: TLogItem);
+begin
+  WriteLogWithExtData(LogItem, nil);
+end;
+
+procedure TDatabaseHandler.WriteLogWithExtData(const LogItem: TLogItem; const ExtData: TLogExtendedData);
+var
+  LogId: Integer;
+begin
+  try
+    // 항상 JSON 파일에 기록
+    WriteJsonLog(LogItem, ExtData);
+
+    if not FConnected then
+      Exit;
+
+    // 데이터베이스에 직접 기록
+    FConnection.StartTransaction;
+    try
+      LogId := GetLogRecordId(LogItem);
+
+      if Assigned(ExtData) then
+        WriteExtendedData(LogId, ExtData);
+
+      FConnection.Commit;
+    except
+      on E: Exception do
+      begin
+        FConnection.Rollback;
+        raise;
+      end;
+    end;
+  except
+    // 에러 발생 시 핸들링 (파일에 기록 등)
+    on E: Exception do
+    begin
+      // 여기서는 예외를 삼킴 (로거에서 예외가 발생하면 앱이 중단될 수 있음)
+    end;
+  end;
+end;
+
+function TDatabaseHandler.GetLogRecordId(const LogItem: TLogItem): Integer;
+var
+  JsonObj: TMcJsonObject;
+  RawJson: string;
+begin
+  FQuery.SQL.Text := 'SELECT NEXT VALUE FOR GEN_LOG_ID FROM RDB$DATABASE';
+  FQuery.Open;
+  Result := FQuery.Fields[0].AsInteger;
+  FQuery.Close;
+
+  // JSON 객체 생성
+  JsonObj := TMcJsonObject.Create;
+  try
+    JsonObj.Add('timestamp', FormatDateTime(LogItem.TimeStamp));
+    JsonObj.Add('level', LogItem.Level.ToString);
+    JsonObj.Add('source', LogItem.Source);
+    JsonObj.Add('message', LogItem.Message);
+
+    RawJson := JsonObj.AsJson;
+
+    // 로그 레코드 삽입
+    FQuery.SQL.Text :=
+      'INSERT INTO LOG_MASTER (LOG_ID, TIMESTAMP, LEVEL, SOURCE, MESSAGE, RAW_JSON) ' +
+      'VALUES (:LOG_ID, :TIMESTAMP, :LEVEL, :SOURCE, :MESSAGE, :RAW_JSON)';
+    FQuery.ParamByName('LOG_ID').AsInteger := Result;
+    FQuery.ParamByName('TIMESTAMP').AsDateTime := LogItem.TimeStamp;
+    FQuery.ParamByName('LEVEL').AsString := LogItem.Level.ToString;
+    FQuery.ParamByName('SOURCE').AsString := LogItem.Source;
+    FQuery.ParamByName('MESSAGE').AsString := LogItem.Message;
+    FQuery.ParamByName('RAW_JSON').AsString := RawJson;
+    FQuery.ExecSQL;
+  finally
+    JsonObj.Free;
+  end;
+end;
+
+procedure TDatabaseHandler.WriteExtendedData(LogId: Integer; const ExtData: TLogExtendedData);
+begin
+  // JSON 확장 데이터를 LOG_MASTER.EXTRAS에 저장
+  FQuery.SQL.Text := 'UPDATE LOG_MASTER SET EXTRAS = :JSON_DATA WHERE LOG_ID = :LOG_ID';
+  FQuery.ParamByName('JSON_DATA').AsString := ExtData.AsJson;
+  FQuery.ParamByName('LOG_ID').AsInteger := LogId;
+  FQuery.ExecSQL;
+end;
+
+function TDatabaseHandler.GetJsonLogFileName: string;
+var
+  DateDir: string;
+begin
+  // 날짜별 디렉토리 생성
+  DateDir := IncludeTrailingPathDelimiter(FJsonLogPath + FormatDateTime('yyyy-mm-dd', Now));
+
+  if not DirectoryExists(DateDir) then
+    ForceDirectories(DateDir);
+
+  Result := DateDir + FormatDateTime('yyyy-mm-dd', Now) + '.jsonl';
+end;
+
+procedure TDatabaseHandler.WriteJsonLog(const LogItem: TLogItem; const ExtData: TLogExtendedData = nil);
+var
+  LogFile: TextFile;
+  JsonObj: TMcJsonObject;
+  FilePath: string;
+begin
+  FilePath := GetJsonLogFileName;
+
+  // JSON 객체 생성
+  JsonObj := TMcJsonObject.Create;
+  try
+    // 기본 로그 정보 추가
+    JsonObj.Add('timestamp', FormatDateTime(LogItem.TimeStamp));
+    JsonObj.Add('level', LogItem.Level.ToString);
+    JsonObj.Add('source', LogItem.Source);
+    JsonObj.Add('message', LogItem.Message);
+
+    // 확장 데이터가 있으면 추가
+    if Assigned(ExtData) then
+      JsonObj.Add('metadata', ExtData.AsJsonObject);
+
+    // JSON Lines 형식으로 파일에 쓰기
+    AssignFile(LogFile, FilePath);
+    if FileExists(FilePath) then
+      Append(LogFile)
+    else
+      Rewrite(LogFile);
+
+    try
+      WriteLn(LogFile, JsonObj.AsJson);
+    finally
+      CloseFile(LogFile);
+    end;
+
+  finally
+    JsonObj.Free;
+  end;
+end;
+
+procedure TDatabaseHandler.SyncJsonToDatabase;
+var
+  SearchRec: TSearchRec;
+  FilePath, Line: string;
+  LogFile: TextFile;
+  JsonObj: TMcJsonObject;
+  LogItem: TLogItem;
+  ExtData: TLogExtendedData;
+begin
+  if not FConnected then
+    Exit;
+
+  if FindFirst(IncludeTrailingPathDelimiter(FJsonLogPath) + '*.jsonl', faAnyFile, SearchRec) = 0 then
+  begin
+    try
+      repeat
+        FilePath := IncludeTrailingPathDelimiter(FJsonLogPath) + SearchRec.Name;
+
+        // 파일의 각 라인에서 JSON 파싱
+        AssignFile(LogFile, FilePath);
+        try
+          Reset(LogFile);
+
+          FConnection.StartTransaction;
+          try
+            while not Eof(LogFile) do
+            begin
+              ReadLn(LogFile, Line);
+
+              if Trim(Line) <> '' then
+              begin
+                JsonObj := TMcJsonObject.Create;
+                try
+                  JsonObj.Parse(Line);
+
+                  // LogItem 생성
+                  LogItem := TLogItem.Create;
+                  try
+                    LogItem.TimeStamp := ISO8601ToDate(JsonObj.S['timestamp'], True);
+                    LogItem.Level := TLogLevel(GetEnumValue(TypeInfo(TLogLevel), 'll' + JsonObj.S['level']));
+                    LogItem.Source := JsonObj.S['source'];
+                    LogItem.Message := JsonObj.S['message'];
+
+                    // 확장 데이터 처리
+                    if JsonObj.Contains('metadata') then
+                    begin
+                      ExtData := TLogExtendedData.Create;
+                      try
+                        ExtData.AddJsonObject('metadata', JsonObj.O['metadata']);
+                        WriteLogWithExtData(LogItem, ExtData);
+                      finally
+                        ExtData.Free;
+                      end;
+                    end
+                    else
+                      WriteLog(LogItem);
+
+                  finally
+                    LogItem.Free;
+                  end;
+                finally
+                  JsonObj.Free;
+                end;
+              end;
+            end;
+
+            FConnection.Commit;
+          except
+            FConnection.Rollback;
+            raise;
+          end;
+
+        finally
+          CloseFile(LogFile);
+        end;
+
+        // 처리된 파일 이동 또는 삭제 (옵션)
+        // RenameFile(FilePath, FilePath + '.processed');
+
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec);
+    end;
+  end;
+end;
+
+procedure TDatabaseHandler.ExecuteLogMaintenance;
+var
+  CutoffDate: TDateTime;
+begin
+  if not FConnected then
+    Exit;
+
+  CutoffDate := IncMonth(Now, -FRetentionMonths);
+
+  FQuery.SQL.Text :=
+    'DELETE FROM LOG_MASTER WHERE TIMESTAMP < :CUTOFF_DATE';
+  FQuery.ParamByName('CUTOFF_DATE').AsDateTime := CutoffDate;
+  FQuery.ExecSQL;
+end;
+
+function TDatabaseHandler.QueryLogs(const SQL: string): TZQuery;
+var
+  Query: TZQuery;
+begin
+  Query := TZQuery.Create(nil);
+  Query.Connection := FConnection;
+  Query.SQL.Text := SQL;
+  Query.Open;
+  Result := Query;
+end;
+
+
+
+
+
+
 // 월별 테이블 이름 생성 (YYYYMM 형식)
 function TDatabaseHandler.GetMonthlyTableName(const ADate: TDateTime): string;
 begin
@@ -325,6 +777,7 @@ function TDatabaseHandler.GetCurrentMonthTableName: string;
 begin
   Result := GetMonthlyTableName(Date);
 end;
+
 
 // 메타 테이블 생성
 procedure TDatabaseHandler.CreateMetaTable;
